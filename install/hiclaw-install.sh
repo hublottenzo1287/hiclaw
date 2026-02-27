@@ -38,13 +38,67 @@ HICLAW_NON_INTERACTIVE="${HICLAW_NON_INTERACTIVE:-0}"
 HICLAW_MOUNT_SOCKET="${HICLAW_MOUNT_SOCKET:-1}"
 
 # ============================================================
+# Utility functions (needed early for timezone detection)
+# ============================================================
+
+log() {
+    echo -e "\033[36m[HiClaw]\033[0m $1"
+}
+
+error() {
+    echo -e "\033[31m[HiClaw ERROR]\033[0m $1" >&2
+    exit 1
+}
+
+# ============================================================
+# Timezone detection (compatible with Linux and macOS)
+# ============================================================
+
+detect_timezone() {
+    local tz=""
+    
+    # Try /etc/timezone (Debian/Ubuntu)
+    if [ -f /etc/timezone ]; then
+        tz=$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]')
+    fi
+    
+    # Try /etc/localtime symlink (macOS and some Linux)
+    if [ -z "${tz}" ] && [ -L /etc/localtime ]; then
+        tz=$(ls -l /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+    fi
+    
+    # Try timedatectl (systemd)
+    if [ -z "${tz}" ]; then
+        tz=$(timedatectl show --value -p Timezone 2>/dev/null)
+    fi
+    
+    # If still not detected, warn and prompt user
+    if [ -z "${tz}" ]; then
+        echo ""
+        echo -e "\033[33m[HiClaw WARNING]\033[0m Could not detect timezone automatically."
+        echo -e "\033[33m[HiClaw]\033[0m Please enter your timezone (e.g., Asia/Shanghai, America/New_York)."
+        echo ""
+        if [ "${HICLAW_NON_INTERACTIVE}" = "1" ]; then
+            tz="Asia/Shanghai"
+            log "Using default timezone: ${tz}"
+        else
+            read -p "Timezone [Asia/Shanghai]: " tz
+            tz="${tz:-Asia/Shanghai}"
+        fi
+    fi
+    
+    echo "${tz}"
+}
+
+# Detect timezone once at startup (used by registry selection and container TZ)
+HICLAW_TIMEZONE="${HICLAW_TIMEZONE:-$(detect_timezone)}"
+
+# ============================================================
 # Registry selection based on timezone
 # ============================================================
 
 detect_registry() {
-    local tz
-    tz="$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]' || \
-          timedatectl show --value -p Timezone 2>/dev/null || echo UTC)"
+    local tz="${HICLAW_TIMEZONE}"
 
     case "${tz}" in
         America/*)
@@ -66,16 +120,133 @@ MANAGER_IMAGE="${HICLAW_INSTALL_MANAGER_IMAGE:-${HICLAW_REGISTRY}/higress/hiclaw
 WORKER_IMAGE="${HICLAW_INSTALL_WORKER_IMAGE:-${HICLAW_REGISTRY}/higress/hiclaw-worker:${HICLAW_VERSION}}"
 
 # ============================================================
-# Utility functions
+# Wait for Manager agent to be ready
+# Uses `openclaw gateway health` inside the container to confirm the gateway is running
 # ============================================================
 
-log() {
-    echo -e "\033[36m[HiClaw]\033[0m $1"
+wait_manager_ready() {
+    local timeout="${HICLAW_READY_TIMEOUT:-300}"
+    local elapsed=0
+    local container="${1:-hiclaw-manager}"
+    
+    log "Waiting for Manager agent to be ready (timeout: ${timeout}s)..."
+    
+    # Wait for OpenClaw gateway to be healthy inside the container
+    while [ "${elapsed}" -lt "${timeout}" ]; do
+        if docker exec "${container}" openclaw gateway health --json 2>/dev/null | grep -q '"ok"' 2>/dev/null; then
+            log "Manager agent is ready!"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+        printf "\r\033[36m[HiClaw]\033[0m Waiting... (%ds/%ds)" "${elapsed}" "${timeout}"
+    done
+    
+    echo ""
+    error "Manager agent did not become ready within ${timeout}s. Check: docker logs ${container}"
 }
 
-error() {
-    echo -e "\033[31m[HiClaw ERROR]\033[0m $1" >&2
-    exit 1
+# ============================================================
+# Send welcome message to Manager
+# ============================================================
+
+send_welcome_message() {
+    local admin_user="${HICLAW_ADMIN_USER:-admin}"
+    local admin_password="${HICLAW_ADMIN_PASSWORD}"
+    local matrix_domain="${HICLAW_MATRIX_DOMAIN}"
+    local matrix_url="http://${matrix_domain%%:*}:${HICLAW_PORT_GATEWAY:-18080}"
+    local manager_user="manager"
+    local manager_full_id="@${manager_user}:${matrix_domain}"
+    local timezone="${HICLAW_TIMEZONE}"
+    
+    # Login to get admin access token
+    log "Logging in as ${admin_user} to send welcome message..."
+    local login_resp
+    login_resp=$(curl -sf -X POST "${matrix_url}/_matrix/client/v3/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"${admin_user}\"},\"password\":\"${admin_password}\"}" 2>/dev/null) || return 1
+    
+    local access_token
+    access_token=$(echo "${login_resp}" | jq -r '.access_token // empty')
+    if [ -z "${access_token}" ]; then
+        log "WARNING: Failed to login as ${admin_user}, skipping welcome message"
+        return 1
+    fi
+    
+    # Find or create DM room with manager
+    log "Finding DM room with Manager..."
+    local rooms
+    rooms=$(curl -sf "${matrix_url}/_matrix/client/v3/joined_rooms" \
+        -H "Authorization: Bearer ${access_token}" 2>/dev/null | jq -r '.joined_rooms[]' 2>/dev/null) || true
+    
+    local room_id=""
+    for rid in ${rooms}; do
+        local members
+        members=$(curl -sf "${matrix_url}/_matrix/client/v3/rooms/${rid}/members" \
+            -H "Authorization: Bearer ${access_token}" 2>/dev/null | jq -r '.chunk[].state_key' 2>/dev/null) || continue
+        local member_count
+        member_count=$(echo "${members}" | wc -l | xargs)
+        if [ "${member_count}" = "2" ] && echo "${members}" | grep -q "@${manager_user}:"; then
+            room_id="${rid}"
+            break
+        fi
+    done
+    
+    if [ -z "${room_id}" ]; then
+        log "Creating DM room with Manager..."
+        local create_resp
+        create_resp=$(curl -sf -X POST "${matrix_url}/_matrix/client/v3/createRoom" \
+            -H "Authorization: Bearer ${access_token}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"is_direct\":true,\"invite\":[\"${manager_full_id}\"],\"preset\":\"trusted_private_chat\"}" 2>/dev/null) || return 1
+        room_id=$(echo "${create_resp}" | jq -r '.room_id // empty')
+    fi
+    
+    if [ -z "${room_id}" ]; then
+        log "WARNING: Could not find or create DM room with Manager"
+        return 1
+    fi
+    
+    # Wait for Manager to join the room
+    log "Waiting for Manager to join the room..."
+    local wait_elapsed=0
+    local wait_timeout=60
+    while [ "${wait_elapsed}" -lt "${wait_timeout}" ]; do
+        local members
+        members=$(curl -sf "${matrix_url}/_matrix/client/v3/rooms/${room_id}/members" \
+            -H "Authorization: Bearer ${access_token}" 2>/dev/null | jq -r '.chunk[].state_key' 2>/dev/null) || true
+        if echo "${members}" | grep -q "${manager_full_id}"; then
+            break
+        fi
+        sleep 2
+        wait_elapsed=$((wait_elapsed + 2))
+    done
+    
+    # Send welcome message
+    log "Sending welcome message to Manager..."
+    local welcome_msg
+    welcome_msg="Hello Manager! This is an automated message from the HiClaw installation script.
+
+You have just completed the installation and initialization. As the Manager agent, please:
+
+1. Output a warm welcome message introducing your capabilities to the human admin
+2. Based on the current timezone (${timezone}), identify the likely country/region of the admin
+3. Ask the admin in their likely local language (if detectable, otherwise use English) how you can help them
+4. Remember the admin's preferred language for all future interactions with them, with workers, and for instructions you give to workers in project rooms
+
+The human admin will start chatting with you shortly. Please wait for their response before proceeding with any tasks."
+
+    local txn_id="welcome-$(date +%s%N)"
+    curl -sf -X PUT "${matrix_url}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn_id}" \
+        -H "Authorization: Bearer ${access_token}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"msgtype\":\"m.text\",\"body\":\"${welcome_msg}\"}" > /dev/null 2>&1 || {
+        log "WARNING: Failed to send welcome message"
+        return 1
+    }
+    
+    log "Welcome message sent to Manager"
+    return 0
 }
 
 # Prompt for a value interactively, but skip if env var is already set.
@@ -540,9 +711,7 @@ EOF
     WORKSPACE_MOUNT_ARGS="-v ${HICLAW_WORKSPACE_DIR}:/root/manager-workspace"
 
     # Pass host timezone to container so date/time commands reflect local time
-    HOST_TZ="$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]' || \
-               timedatectl show --value -p Timezone 2>/dev/null || echo UTC)"
-    TZ_ARGS="-e TZ=${HOST_TZ}"
+    TZ_ARGS="-e TZ=${HICLAW_TIMEZONE}"
 
     # Host directory mount: for file sharing with agents (defaults to user's home)
     if [ "${HICLAW_NON_INTERACTIVE}" != "1" ] && [ -z "${HICLAW_HOST_SHARE_DIR}" ]; then
@@ -585,6 +754,12 @@ EOF
         ${HOST_SHARE_MOUNT_ARGS} \
         --restart unless-stopped \
         "${MANAGER_IMAGE}"
+
+    # Wait for Manager agent to be ready
+    wait_manager_ready "hiclaw-manager"
+
+    # Send welcome message to Manager
+    send_welcome_message
 
     log ""
     log "=== HiClaw Manager Started! ==="

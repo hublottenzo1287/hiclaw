@@ -25,20 +25,70 @@ See **[docs/quickstart.md](docs/quickstart.md)** for a step-by-step guide from z
 - An LLM API key (e.g., Qwen, OpenAI)
 - (Optional) A GitHub Personal Access Token for GitHub collaboration features
 
-### 30-Second Overview
+### Installation
 
 ```bash
-# Option A: One-line install
+# Quick install (interactive)
 bash <(curl -sSL https://higress.ai/hiclaw/install.sh)
 
-# Option B: Using Make (for developers)
+# Or clone and install
 git clone https://github.com/higress-group/hiclaw.git && cd hiclaw
 HICLAW_LLM_API_KEY="sk-xxx" make install
+```
 
-# Then open Element Web and chat with your Manager Agent
-# http://matrix-client-local.hiclaw.io:8080
+The installation script will:
+1. **Detect your timezone** (supports Linux and macOS) for optimal registry selection
+2. **Prompt for configuration** (LLM provider, API key, ports, etc.) - all can be pre-set via environment variables
+3. **Wait for Manager to be ready** before exiting
+4. **Send a welcome message** to the Manager, which will greet you in your likely local language
 
-# Or send tasks via CLI
+#### Installation Options
+
+```bash
+# Non-interactive mode (use all defaults)
+HICLAW_NON_INTERACTIVE=1 HICLAW_LLM_API_KEY="sk-xxx" make install
+
+# Custom ports
+HICLAW_PORT_GATEWAY=8080 HICLAW_PORT_CONSOLE=8001 HICLAW_LLM_API_KEY="sk-xxx" make install
+
+# External data directory
+HICLAW_DATA_DIR=~/hiclaw-data HICLAW_LLM_API_KEY="sk-xxx" make install
+
+# Pre-configure all settings
+HICLAW_LLM_PROVIDER=qwen \
+HICLAW_DEFAULT_MODEL=qwen3.5-plus \
+HICLAW_LLM_API_KEY="sk-xxx" \
+HICLAW_ADMIN_USER=admin \
+HICLAW_ADMIN_PASSWORD=yourpassword \
+HICLAW_TIMEZONE=Asia/Shanghai \
+make install
+```
+
+#### Upgrade or Reinstall
+
+When running the install script on an existing installation, you'll be prompted:
+
+```
+Choose an action:
+  1) In-place upgrade (keep data, workspace, env file)
+  2) Clean reinstall (remove all data, start fresh)
+  3) Cancel
+```
+
+- **In-place upgrade**: Keeps all data, just recreates the Manager container. Optionally rebuild Worker containers if the image has changed.
+- **Clean reinstall**: Removes everything (Docker volume, workspace directory, env file, Worker containers). Requires manual confirmation of the workspace path.
+
+### Post-Installation
+
+After installation completes:
+
+1. Open Element Web: `http://matrix-client-local.hiclaw.io:<port>` (default port: 18080)
+2. Login with your admin credentials
+3. The Manager will greet you and introduce its capabilities
+
+Or send tasks via CLI:
+
+```bash
 make replay TASK="Create a Worker named alice for frontend development. Create it directly."
 ```
 
