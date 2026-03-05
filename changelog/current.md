@@ -21,3 +21,4 @@ Record image-affecting changes to `manager/`, `worker/`, `openclaw-base/` here b
 - fix(manager): `builtin-merge.sh` — replace `[ -n ] && printf` with `if/fi` to avoid exit 1 when user_content is empty
 - fix(manager): `builtin-merge.sh` — add explicit ERROR logging on all write/move failures so startup failures are visible in logs
 - fix(manager): `upgrade-builtins.sh` — replace silent `|| true` with WARNING log when worker-skill MinIO publish fails
+- ci: release workflow now opens a PR (`chore/archive-changelog-vX.Y.Z`) instead of pushing directly to main ([f07de3a](https://github.com/higress-group/hiclaw/commit/f07de3a))
