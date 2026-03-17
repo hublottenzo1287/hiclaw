@@ -190,9 +190,11 @@ When `--runtime copaw` is specified:
 - The worker entry in `workers-registry.json` will have `"runtime": "copaw"`
 
 **Default behavior** (without `--remote`):
-- Starts the Worker container locally. In a standard HiClaw installation the Docker socket is always mounted — this is the expected path for all local deployments.
+- In local deployments (`HICLAW_CONTAINER_RUNTIME=socket`): starts the Worker container locally via Docker.
+- In cloud deployments (`HICLAW_CONTAINER_RUNTIME=cloud`): creates the Worker as a SAE application via cloud API. No Docker socket is needed — the script automatically detects cloud mode and uses the SAE backend.
+- If neither is available (`HICLAW_CONTAINER_RUNTIME=none`): falls back to outputting an install command (same as `--remote`).
 
-Only use `--remote` when the admin **explicitly** requests deploying the Worker on a separate machine (e.g., "create a remote worker", "I'll run it on my laptop"). Do **NOT** use `--remote` when the admin just says "create a worker" or does not mention deployment location.
+Only use `--remote` when the admin **explicitly** requests deploying the Worker on a separate machine (e.g., "create a remote worker", "I'll run it on my laptop"). Do **NOT** use `--remote` when the admin just says "create a worker" or does not mention deployment location — even in cloud mode, the script handles Worker creation automatically.
 
 The script outputs a JSON result after `---RESULT---`:
 
@@ -224,11 +226,10 @@ For local deployment these are auto-resolved via container ExtraHosts.
 
 ### Post-creation verification
 
-After a local deployment (`mode: "local"`), verify the Worker is running:
+After a non-remote deployment, verify the Worker is running:
 
 ```bash
-bash -c 'source /opt/hiclaw/scripts/lib/container-api.sh && container_status_worker "<WORKER_NAME>"'
-bash -c 'source /opt/hiclaw/scripts/lib/container-api.sh && container_logs_worker "<WORKER_NAME>" 20'
+bash -c 'source /opt/hiclaw/scripts/lib/container-api.sh && worker_backend_status "<WORKER_NAME>"'
 ```
 
 ### Post-creation greeting
@@ -268,7 +269,7 @@ for meta in /root/hiclaw-fs/shared/tasks/*/meta.json; do
 done
 
 # Check a Worker's Room for recent activity:
-curl -s "http://127.0.0.1:6167/_matrix/client/v3/rooms/<ROOM_ID>/messages?dir=b&limit=5" \
+curl -s "${HICLAW_MATRIX_SERVER:-http://127.0.0.1:6167}/_matrix/client/v3/rooms/<ROOM_ID>/messages?dir=b&limit=5" \
   -H "Authorization: Bearer <MANAGER_TOKEN>" | jq '.chunk[].content.body'
 ```
 
@@ -295,7 +296,7 @@ The Manager automatically detects idle Workers during Heartbeat and stops their 
 ```
 
 Fields:
-- `container_status`: actual status synced from the Docker API (`running` / `stopped` / `not_found` / `remote`)
+- `container_status`: actual status synced from the worker backend (`running` / `stopped` / `not_found` / `remote`)
 - `idle_since`: timestamp when the Worker last had no active finite tasks; set to null when a finite task is active
 - `auto_stopped_at`: when the Manager auto-stopped the container (audit trail)
 - `last_started_at`: when the Manager last started/woke the container
@@ -319,6 +320,7 @@ bash /opt/hiclaw/agent/skills/worker-management/scripts/lifecycle-worker.sh --ac
 
 # Manually wake up (start) a stopped Worker container
 bash /opt/hiclaw/agent/skills/worker-management/scripts/lifecycle-worker.sh --action start --worker <name>
+
 ```
 
 ### Changing the Idle Timeout
@@ -336,7 +338,7 @@ jq '.idle_timeout_minutes = 60' ~/worker-lifecycle.json > /tmp/lc.json && mv /tm
 |-----------|---------|-------|
 | Container is stopped | `lifecycle-worker.sh --action start` | Restarts the existing container, preserving all config and mounts |
 | Container does not exist (`not_found`) | `create-worker.sh` | Rebuilds from image; full registration flow required |
-| Worker needs reset or config update | `create-worker.sh` (removes old container first) | Full rebuild; Matrix account is reused |
+| Worker needs reset | `create-worker.sh` | Removes old container first, then full registration flow |
 | copaw runtime worker (container) | `lifecycle-worker.sh --action start` | Restarts the existing CoPaw container |
 | copaw runtime worker (remote) | `copaw-worker --name <name> ...` (on target machine) | Not container-managed; lifecycle scripts skip these workers |
 | Any runtime worker (remote deployment) | Admin runs install command on target machine | `deployment: "remote"` in registry; Manager skips auto-restart on upgrade |
@@ -364,6 +366,8 @@ Provide the `install_cmd` value **verbatim in a code block** to the admin — do
 ## CoPaw Console Management
 
 The CoPaw console is a browser-based management dashboard for the CoPaw Worker — the admin can view Worker status, logs, configuration, and other operational details from a single web page.
+
+> **Cloud deployment (SAE) note:** CoPaw console is only available for local container deployments. On cloud (SAE), use the SAE application console or SLS logs to view Worker status and logs. The `enable-worker-console.sh` script will exit with an error in cloud mode.
 
 CoPaw Workers are created without the console by default to save ~500MB RAM. Enable it on demand when the admin asks to "open console", "open terminal", "debug the worker", "access the worker shell", or similar.
 
@@ -399,11 +403,12 @@ This script:
 
 ## Reset a Worker
 
-1. Revoke the Worker's Higress Consumer (or update credentials)
-2. Remove Worker from AI route auth configs (`/v1/ai/routes` — GET, remove from allowedConsumers, PUT)
-3. Remove Worker from MCP Server consumer lists (`/v1/mcpServer/consumers`)
-4. Delete Worker's config directory: `rm -rf /root/hiclaw-fs/agents/<WORKER_NAME>/`
-5. Re-create: write a new SOUL.md and run `create-worker.sh` again (the script handles re-registration gracefully)
+1. Remove the Worker's config directory:
+   ```bash
+   rm -rf /root/hiclaw-fs/agents/<WORKER_NAME>/
+   ```
+
+2. Re-create: write a new SOUL.md and run `create-worker.sh` again (the script handles re-registration gracefully — it removes the old container first, then creates a fresh one with updated config)
 
 ## Manage Worker Skills
 
@@ -482,7 +487,7 @@ After pushing skills, the script notifies the affected Worker(s) via Matrix @men
 
 ## Important Notes
 
-- Workers are **stateless containers** -- all state is in MinIO. Resetting a Worker just means recreating its config files
+- Workers are **stateless** -- all state is in the centralized storage. Resetting a Worker just means recreating its config files
 - Worker Matrix accounts persist in Tuwunel (cannot be deleted via API). Reuse same username on reset
 - OpenClaw config hot-reload: file-watch (~300ms) or `config.patch` API
 - **File sync**: after writing any file that a Worker (or another Worker) needs to read, always notify the target Worker via Matrix to use their `file-sync` skill. This applies to config updates, task briefs, shared data, and cross-Worker collaboration artifacts. The exact sync command varies by runtime — the Worker's `file-sync` SKILL.md defines how to execute it. Background periodic sync (every 5 minutes) serves as fallback only

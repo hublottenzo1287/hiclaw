@@ -13,6 +13,7 @@
 #   update-worker-model.sh --worker alice --model deepseek-chat --no-reasoning
 
 set -euo pipefail
+source /opt/hiclaw/scripts/lib/hiclaw-env.sh
 
 REGISTRY_FILE="${HOME}/workers-registry.json"
 
@@ -110,8 +111,12 @@ update_worker_model() {
         rm -f /tmp/model-test-resp-${worker}.json
         _log "ERROR: Model test failed (HTTP ${http_code}): ${resp_body}"
         _log "The model '${new_model}' is not reachable via the AI Gateway."
-        _log "Please check the Higress Console to confirm the AI route is configured for this model:"
-        _log "  http://<manager-host>:8001  →  AI Routes → verify provider and model mapping"
+        if [ "${HICLAW_RUNTIME:-}" = "aliyun" ]; then
+            _log "Please check the Alibaba Cloud AI Gateway console to confirm the model route is configured."
+        else
+            _log "Please check the Higress Console to confirm the AI route is configured for this model:"
+            _log "  http://<manager-host>:8001  →  AI Routes → verify provider and model mapping"
+        fi
         return 1
     fi
     rm -f /tmp/model-test-resp-${worker}.json
@@ -119,7 +124,7 @@ update_worker_model() {
     # ─────────────────────────────────────────────────────────────────────────
 
     # Pull openclaw.json from MinIO
-    local minio_path="hiclaw/hiclaw-storage/agents/${worker}/openclaw.json"
+    local minio_path="${HICLAW_STORAGE_PREFIX}/agents/${worker}/openclaw.json"
     local tmp_in="/tmp/openclaw-${worker}-model-update-in.json"
     local tmp_out="/tmp/openclaw-${worker}-model-update-out.json"
 
@@ -197,7 +202,7 @@ update_worker_model() {
         local msg_body
         msg_body="@${worker}:${matrix_domain} Your model has been updated to \`${new_model}\` (reasoning=${REASONING}). Please use your file-sync skill to sync the latest config."
         curl -sf -X PUT \
-            "http://127.0.0.1:6167/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn_id}" \
+            "${HICLAW_MATRIX_SERVER}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn_id}" \
             -H "Authorization: Bearer ${manager_token}" \
             -H 'Content-Type: application/json' \
             -d "{\"msgtype\":\"m.text\",\"body\":\"${msg_body}\",\"m.mentions\":{\"user_ids\":[\"@${worker}:${matrix_domain}\"]}}" \

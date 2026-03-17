@@ -22,21 +22,24 @@ VERSION        ?= latest
 REGISTRY       ?= higress-registry.cn-hangzhou.cr.aliyuncs.com
 REPO           ?= higress
 
-MANAGER_IMAGE       ?= $(REGISTRY)/$(REPO)/hiclaw-manager
-WORKER_IMAGE        ?= $(REGISTRY)/$(REPO)/hiclaw-worker
-COPAW_WORKER_IMAGE  ?= $(REGISTRY)/$(REPO)/hiclaw-copaw-worker
-OPENCLAW_BASE_IMAGE ?= $(REGISTRY)/$(REPO)/openclaw-base
+MANAGER_IMAGE        ?= $(REGISTRY)/$(REPO)/hiclaw-manager
+MANAGER_ALIYUN_IMAGE ?= $(REGISTRY)/$(REPO)/hiclaw-manager-aliyun
+WORKER_IMAGE         ?= $(REGISTRY)/$(REPO)/hiclaw-worker
+COPAW_WORKER_IMAGE   ?= $(REGISTRY)/$(REPO)/hiclaw-copaw-worker
+OPENCLAW_BASE_IMAGE  ?= $(REGISTRY)/$(REPO)/openclaw-base
 
-MANAGER_TAG    ?= $(MANAGER_IMAGE):$(VERSION)
-WORKER_TAG     ?= $(WORKER_IMAGE):$(VERSION)
-COPAW_WORKER_TAG ?= $(COPAW_WORKER_IMAGE):$(VERSION)
-OPENCLAW_BASE_TAG ?= $(OPENCLAW_BASE_IMAGE):$(VERSION)
+MANAGER_TAG        ?= $(MANAGER_IMAGE):$(VERSION)
+MANAGER_ALIYUN_TAG ?= $(MANAGER_ALIYUN_IMAGE):$(VERSION)
+WORKER_TAG         ?= $(WORKER_IMAGE):$(VERSION)
+COPAW_WORKER_TAG   ?= $(COPAW_WORKER_IMAGE):$(VERSION)
+OPENCLAW_BASE_TAG  ?= $(OPENCLAW_BASE_IMAGE):$(VERSION)
 
 # Local image names (no registry prefix, used by tests and install script)
-LOCAL_MANAGER       = hiclaw/manager-agent:$(VERSION)
-LOCAL_WORKER        = hiclaw/worker-agent:$(VERSION)
-LOCAL_COPAW_WORKER  = hiclaw/copaw-worker:$(VERSION)
-LOCAL_OPENCLAW_BASE = hiclaw/openclaw-base:$(VERSION)
+LOCAL_MANAGER        = hiclaw/manager-agent:$(VERSION)
+LOCAL_MANAGER_ALIYUN = hiclaw/manager-aliyun:$(VERSION)
+LOCAL_WORKER         = hiclaw/worker-agent:$(VERSION)
+LOCAL_COPAW_WORKER   = hiclaw/copaw-worker:$(VERSION)
+LOCAL_OPENCLAW_BASE  = hiclaw/openclaw-base:$(VERSION)
 
 # Higress base image registry (regional mirrors auto-synced from cn-hangzhou primary)
 #   China (default): higress-registry.cn-hangzhou.cr.aliyuncs.com
@@ -59,6 +62,9 @@ endif
 REGISTRY_ARG = --build-arg HIGRESS_REGISTRY=$(HIGRESS_REGISTRY)
 BUILTIN_VERSION_ARG = --build-arg BUILTIN_VERSION=$(VERSION)
 
+# Named build context for shared libraries (requires BuildKit / Docker 23+)
+SHARED_LIB_CTX = --build-context shared=./shared/lib
+
 # Multi-arch build configuration
 # Platforms for multi-arch builds (comma-separated, no spaces)
 MULTIARCH_PLATFORMS ?= linux/amd64,linux/arm64
@@ -78,8 +84,8 @@ TEST_FILTER    ?=
 
 # ---------- Phony targets ----------
 
-.PHONY: all build build-openclaw-base build-manager build-worker build-copaw-worker \
-        tag push push-openclaw-base push-manager push-worker push-copaw-worker \
+.PHONY: all build build-openclaw-base build-manager build-manager-aliyun build-worker build-copaw-worker \
+        tag push push-openclaw-base push-manager push-manager-aliyun push-worker push-copaw-worker \
         push-native push-native-manager push-native-worker push-native-copaw-worker \
         buildx-setup \
         test test-quick test-installed \
@@ -92,7 +98,7 @@ all: build
 
 # ---------- Build ----------
 
-build: build-manager build-worker build-copaw-worker ## Build all images (base image pulled from registry, not rebuilt locally)
+build: build-manager build-manager-aliyun build-worker build-copaw-worker ## Build all images (base image pulled from registry, not rebuilt locally)
 
 build-openclaw-base: ## Build OpenClaw base image
 	@echo "==> Building OpenClaw base image: $(LOCAL_OPENCLAW_BASE) (registry: $(HIGRESS_REGISTRY))"
@@ -109,13 +115,20 @@ OPENCLAW_BASE_PUSH_ARG  = --build-arg OPENCLAW_BASE_IMAGE=$(OPENCLAW_BASE_IMAGE)
 
 build-manager: ## Build Manager image
 	@echo "==> Building Manager image: $(LOCAL_MANAGER) (registry: $(HIGRESS_REGISTRY))"
-	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
+	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_BUILD_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 		-t $(LOCAL_MANAGER) \
 		./manager/
 
+build-manager-aliyun: ## Build Manager Aliyun image
+	@echo "==> Building Manager Aliyun image: $(LOCAL_MANAGER_ALIYUN) (registry: $(HIGRESS_REGISTRY))"
+	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
+		-f manager/Dockerfile.aliyun \
+		-t $(LOCAL_MANAGER_ALIYUN) \
+		.
+
 build-worker: ## Build Worker image
 	@echo "==> Building Worker image: $(LOCAL_WORKER) (registry: $(HIGRESS_REGISTRY))"
-	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(OPENCLAW_BASE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
+	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(OPENCLAW_BASE_BUILD_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 		-t $(LOCAL_WORKER) \
 		./worker/
 
@@ -129,10 +142,12 @@ build-copaw-worker: ## Build CoPaw Worker image
 
 tag: build ## Tag images for registry push
 	docker tag $(LOCAL_MANAGER) $(MANAGER_TAG)
+	docker tag $(LOCAL_MANAGER_ALIYUN) $(MANAGER_ALIYUN_TAG)
 	docker tag $(LOCAL_WORKER) $(WORKER_TAG)
 	docker tag $(LOCAL_COPAW_WORKER) $(COPAW_WORKER_TAG)
 ifeq ($(PUSH_LATEST),yes)
 	docker tag $(LOCAL_MANAGER) $(MANAGER_IMAGE):latest
+	docker tag $(LOCAL_MANAGER_ALIYUN) $(MANAGER_ALIYUN_IMAGE):latest
 	docker tag $(LOCAL_WORKER) $(WORKER_IMAGE):latest
 	docker tag $(LOCAL_COPAW_WORKER) $(COPAW_WORKER_IMAGE):latest
 	@echo "==> Images tagged as $(VERSION) and latest"
@@ -162,7 +177,7 @@ else
 	fi
 endif
 
-push: push-manager push-worker push-copaw-worker ## Build + push multi-arch images (amd64 + arm64); base image built separately via build-base.yml
+push: push-manager push-manager-aliyun push-worker push-copaw-worker ## Build + push multi-arch images (amd64 + arm64); base image built separately via build-base.yml
 
 push-openclaw-base: buildx-setup ## Build + push multi-arch OpenClaw base image
 	@echo "==> Building + pushing multi-arch OpenClaw base: $(OPENCLAW_BASE_TAG) [$(MULTIARCH_PLATFORMS)]"
@@ -198,7 +213,7 @@ ifeq ($(IS_PODMAN),1)
 	$(foreach plat,$(subst $(comma), ,$(MULTIARCH_PLATFORMS)), \
 		echo "  -> Building Manager for $(plat)..." && \
 		podman build --platform $(plat) \
-			$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+			$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 			--manifest $(MANAGER_TAG) \
 			./manager/ && ) true
 	podman manifest push --all $(MANAGER_TAG) docker://$(MANAGER_TAG)
@@ -209,11 +224,39 @@ else
 	docker buildx build \
 		--builder $(BUILDX_BUILDER) \
 		--platform $(MULTIARCH_PLATFORMS) \
-		$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+		$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 		-t $(MANAGER_TAG) \
 		$(if $(PUSH_LATEST),-t $(MANAGER_IMAGE):latest) \
 		--push \
 		./manager/
+endif
+
+push-manager-aliyun: buildx-setup ## Build + push multi-arch Manager Aliyun image
+	@echo "==> Building + pushing multi-arch Manager Aliyun: $(MANAGER_ALIYUN_TAG) [$(MULTIARCH_PLATFORMS)]"
+ifeq ($(IS_PODMAN),1)
+	@# Podman: build each platform into a manifest list, then push
+	-podman manifest rm $(MANAGER_ALIYUN_TAG) 2>/dev/null
+	$(foreach plat,$(subst $(comma), ,$(MULTIARCH_PLATFORMS)), \
+		echo "  -> Building Manager Aliyun for $(plat)..." && \
+		podman build --platform $(plat) \
+			$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+			-f manager/Dockerfile.aliyun \
+			--manifest $(MANAGER_ALIYUN_TAG) \
+			. && ) true
+	podman manifest push --all $(MANAGER_ALIYUN_TAG) docker://$(MANAGER_ALIYUN_TAG)
+	$(if $(PUSH_LATEST), \
+		podman manifest push --all $(MANAGER_ALIYUN_TAG) docker://$(MANAGER_ALIYUN_IMAGE):latest && \
+		echo "  -> Also pushed :latest tag")
+else
+	docker buildx build \
+		--builder $(BUILDX_BUILDER) \
+		--platform $(MULTIARCH_PLATFORMS) \
+		$(REGISTRY_ARG) $(BUILTIN_VERSION_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+		-f manager/Dockerfile.aliyun \
+		-t $(MANAGER_ALIYUN_TAG) \
+		$(if $(PUSH_LATEST),-t $(MANAGER_ALIYUN_IMAGE):latest) \
+		--push \
+		.
 endif
 
 push-worker: buildx-setup ## Build + push multi-arch Worker image
@@ -224,7 +267,7 @@ ifeq ($(IS_PODMAN),1)
 	$(foreach plat,$(subst $(comma), ,$(MULTIARCH_PLATFORMS)), \
 		echo "  -> Building Worker for $(plat)..." && \
 		podman build --platform $(plat) \
-			$(REGISTRY_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+			$(REGISTRY_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 			--manifest $(WORKER_TAG) \
 			./worker/ && ) true
 	podman manifest push --all $(WORKER_TAG) docker://$(WORKER_TAG)
@@ -235,7 +278,7 @@ else
 	docker buildx build \
 		--builder $(BUILDX_BUILDER) \
 		--platform $(MULTIARCH_PLATFORMS) \
-		$(REGISTRY_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(DOCKER_BUILD_ARGS) \
+		$(REGISTRY_ARG) $(OPENCLAW_BASE_PUSH_ARG) $(SHARED_LIB_CTX) $(DOCKER_BUILD_ARGS) \
 		-t $(WORKER_TAG) \
 		$(if $(PUSH_LATEST),-t $(WORKER_IMAGE):latest) \
 		--push \
@@ -429,6 +472,7 @@ clean: ## Remove local images and test containers
 	-docker ps -a --filter "name=hiclaw-test-worker-" --format '{{.Names}}' | xargs -r docker rm -f 2>/dev/null
 	@echo "==> Removing local images..."
 	-docker rmi $(LOCAL_MANAGER) 2>/dev/null
+	-docker rmi $(LOCAL_MANAGER_ALIYUN) 2>/dev/null
 	-docker rmi $(LOCAL_WORKER) 2>/dev/null
 	-docker rmi $(LOCAL_COPAW_WORKER) 2>/dev/null
 	-docker rmi $(LOCAL_OPENCLAW_BASE) 2>/dev/null

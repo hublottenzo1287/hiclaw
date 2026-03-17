@@ -8,7 +8,7 @@
 # Output: /root/hiclaw-fs/agents/<WORKER_NAME>/openclaw.json
 
 set -e
-source /opt/hiclaw/scripts/lib/base.sh
+source /opt/hiclaw/scripts/lib/hiclaw-env.sh
 
 WORKER_NAME="$1"
 WORKER_MATRIX_TOKEN="$2"
@@ -64,11 +64,24 @@ export WORKER_NAME
 export WORKER_GATEWAY_AUTH_TOKEN="${GATEWAY_AUTH_TOKEN}"
 export WORKER_MATRIX_TOKEN
 export WORKER_GATEWAY_KEY
-# Matrix Server URL uses internal port 8080 for Docker network
-export HICLAW_MATRIX_SERVER="http://${MATRIX_DOMAIN%%:*}:${MATRIX_SERVER_PORT}"
+# Matrix Server URL:
+#   Cloud mode: Worker connects directly via NLB (HICLAW_MATRIX_URL), not through Higress
+#   Local mode: Worker connects via Higress internal network (domain:8080)
+if [ "${HICLAW_RUNTIME}" = "aliyun" ] && [ -n "${HICLAW_MATRIX_URL:-}" ]; then
+    export HICLAW_MATRIX_SERVER="${HICLAW_MATRIX_URL}"
+else
+    export HICLAW_MATRIX_SERVER="http://${MATRIX_DOMAIN%%:*}:${MATRIX_SERVER_PORT}"
+fi
 # Matrix Domain for user IDs keeps original port (e.g., :9080)
 export HICLAW_MATRIX_DOMAIN="${MATRIX_DOMAIN_FOR_ID}"
-export HICLAW_AI_GATEWAY="http://${AI_GATEWAY_DOMAIN}:8080"
+# AI Gateway URL:
+#   Cloud mode: Worker connects via external NLB (HICLAW_AI_GATEWAY_URL)
+#   Local mode: Worker connects via Higress internal network (domain:8080)
+if [ "${HICLAW_RUNTIME}" = "aliyun" ] && [ -n "${HICLAW_AI_GATEWAY_URL:-}" ]; then
+    export HICLAW_AI_GATEWAY="${HICLAW_AI_GATEWAY_URL}"
+else
+    export HICLAW_AI_GATEWAY="http://${AI_GATEWAY_DOMAIN}:8080"
+fi
 export HICLAW_ADMIN_USER="${ADMIN_USER}"
 export HICLAW_DEFAULT_MODEL="${MODEL_NAME}"
 export MODEL_REASONING=true

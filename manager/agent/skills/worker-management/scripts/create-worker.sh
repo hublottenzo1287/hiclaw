@@ -15,7 +15,21 @@
 #     MANAGER_MATRIX_TOKEN
 
 set -e
-source /opt/hiclaw/scripts/lib/base.sh
+source /opt/hiclaw/scripts/lib/hiclaw-env.sh
+source /opt/hiclaw/scripts/lib/container-api.sh
+source /opt/hiclaw/scripts/lib/gateway-api.sh
+
+# Override log() to also write to container's main stdout (/proc/1/fd/1)
+# so that logs are visible in `docker logs` / SAE log viewer even when
+# this script is executed by OpenClaw's exec tool (which captures stdout).
+log() {
+    local msg="[hiclaw $(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "${msg}"
+    # Write to PID 1's stdout if available (container main process)
+    if [ -w /proc/1/fd/1 ]; then
+        echo "${msg}" > /proc/1/fd/1
+    fi
+}
 
 # ============================================================
 # Parse arguments
@@ -121,7 +135,7 @@ if [ -z "${MANAGER_MATRIX_TOKEN}" ]; then
     if [ -z "${MANAGER_PASSWORD}" ]; then
         _fail "MANAGER_MATRIX_TOKEN not set and HICLAW_MANAGER_PASSWORD not available"
     fi
-    MANAGER_MATRIX_TOKEN=$(curl -sf -X POST http://127.0.0.1:6167/_matrix/client/v3/login \
+    MANAGER_MATRIX_TOKEN=$(curl -sf -X POST ${HICLAW_MATRIX_SERVER}/_matrix/client/v3/login \
         -H 'Content-Type: application/json' \
         -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"manager"},"password":"'"${MANAGER_PASSWORD}"'"}' \
         2>/dev/null | jq -r '.access_token // empty')
@@ -131,16 +145,7 @@ if [ -z "${MANAGER_MATRIX_TOKEN}" ]; then
     log "Obtained Manager Matrix token via login"
 fi
 
-if [ -z "${HIGRESS_COOKIE_FILE}" ] || [ ! -s "${HIGRESS_COOKIE_FILE}" ]; then
-    HIGRESS_COOKIE_FILE="/tmp/higress-session-cookie-worker-create"
-    ADMIN_PASSWORD="${HICLAW_ADMIN_PASSWORD:-admin}"
-    curl -sf -o /dev/null -X POST http://127.0.0.1:8001/session/login \
-        -H 'Content-Type: application/json' \
-        -c "${HIGRESS_COOKIE_FILE}" \
-        -d '{"username":"'"${ADMIN_USER}"'","password":"'"${ADMIN_PASSWORD}"'"}' 2>/dev/null \
-        || _fail "Failed to login to Higress Console"
-    log "Obtained Higress session cookie via login"
-fi
+gateway_ensure_session || _fail "Failed to establish gateway session"
 
 # ============================================================
 # Step 1: Register Matrix Account
@@ -159,7 +164,7 @@ else
 fi
 [ -z "${WORKER_MINIO_PASSWORD}" ] && WORKER_MINIO_PASSWORD=$(generateKey 24)
 
-REG_RESP=$(curl -s -X POST http://127.0.0.1:6167/_matrix/client/v3/register \
+REG_RESP=$(curl -s -X POST ${HICLAW_MATRIX_SERVER}/_matrix/client/v3/register \
     -H 'Content-Type: application/json' \
     -d '{
         "username": "'"${WORKER_NAME}"'",
@@ -176,7 +181,7 @@ if echo "${REG_RESP}" | jq -e '.access_token' > /dev/null 2>&1; then
 else
     # Account already exists — login with persisted password
     log "  Account exists, logging in..."
-    LOGIN_RESP=$(curl -s -X POST http://127.0.0.1:6167/_matrix/client/v3/login \
+    LOGIN_RESP=$(curl -s -X POST ${HICLAW_MATRIX_SERVER}/_matrix/client/v3/login \
         -H 'Content-Type: application/json' \
         -d '{
             "type": "m.login.password",
@@ -204,12 +209,13 @@ CREDS
 chmod 600 "${WORKER_CREDS_FILE}"
 
 # ============================================================
-# Step 1b: Create MinIO user with restricted permissions
+# Step 1b: Create storage user with restricted permissions
 # ============================================================
-log "Step 1b: Creating MinIO user for ${WORKER_NAME}..."
-POLICY_NAME="worker-${WORKER_NAME}"
-POLICY_FILE=$(mktemp /tmp/minio-policy-XXXXXX.json)
-cat > "${POLICY_FILE}" <<POLICY
+if [ "${HICLAW_RUNTIME}" != "aliyun" ]; then
+    log "Step 1b: Creating MinIO user for ${WORKER_NAME}..."
+    POLICY_NAME="worker-${WORKER_NAME}"
+    POLICY_FILE=$(mktemp /tmp/minio-policy-XXXXXX.json)
+    cat > "${POLICY_FILE}" <<POLICY
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -237,12 +243,15 @@ cat > "${POLICY_FILE}" <<POLICY
   ]
 }
 POLICY
-mc admin user add hiclaw "${WORKER_NAME}" "${WORKER_MINIO_PASSWORD}" 2>/dev/null || true
-mc admin policy remove hiclaw "${POLICY_NAME}" 2>/dev/null || true
-mc admin policy create hiclaw "${POLICY_NAME}" "${POLICY_FILE}"
-mc admin policy attach hiclaw "${POLICY_NAME}" --user "${WORKER_NAME}"
-rm -f "${POLICY_FILE}"
-log "  MinIO user ${WORKER_NAME} created with policy ${POLICY_NAME}"
+    mc admin user add hiclaw "${WORKER_NAME}" "${WORKER_MINIO_PASSWORD}" 2>/dev/null || true
+    mc admin policy remove hiclaw "${POLICY_NAME}" 2>/dev/null || true
+    mc admin policy create hiclaw "${POLICY_NAME}" "${POLICY_FILE}"
+    mc admin policy attach hiclaw "${POLICY_NAME}" --user "${WORKER_NAME}"
+    rm -f "${POLICY_FILE}"
+    log "  MinIO user ${WORKER_NAME} created with policy ${POLICY_NAME}"
+else
+    log "Step 1b: Skipped (cloud mode uses RRSA for storage auth)"
+fi
 
 # ============================================================
 # Step 2: Create Matrix Room (3-party)
@@ -257,7 +266,7 @@ if [ "${HICLAW_MATRIX_E2EE:-0}" = "1" ] || [ "${HICLAW_MATRIX_E2EE:-}" = "true" 
     log "  E2EE enabled: adding m.room.encryption to room initial_state"
 fi
 
-ROOM_RESP=$(curl -sf -X POST http://127.0.0.1:6167/_matrix/client/v3/createRoom \
+ROOM_RESP=$(curl -sf -X POST ${HICLAW_MATRIX_SERVER}/_matrix/client/v3/createRoom \
     -H "Authorization: Bearer ${MANAGER_MATRIX_TOKEN}" \
     -H 'Content-Type: application/json' \
     -d '{
@@ -284,92 +293,34 @@ fi
 log "  Room created: ${ROOM_ID}"
 
 # ============================================================
-# Step 3: Create Higress Consumer (key-auth)
+# Steps 3-5: Gateway consumer and authorization
 # ============================================================
-log "Step 3: Creating Higress consumer..."
 WORKER_KEY="${WORKER_GATEWAY_KEY}"
-CONSUMER_RESP=$(curl -sf -X POST http://127.0.0.1:8001/v1/consumers \
-    -b "${HIGRESS_COOKIE_FILE}" \
-    -H 'Content-Type: application/json' \
-    -d '{
-        "name": "'"${CONSUMER_NAME}"'",
-        "credentials": [{
-            "type": "key-auth",
-            "source": "BEARER",
-            "values": ["'"${WORKER_KEY}"'"]
-        }]
-    }' 2>/dev/null) || _fail "Failed to create Higress consumer"
-log "  Consumer created: ${CONSUMER_NAME}"
 
-# ============================================================
-# Step 4: Authorize all AI Routes
-# ============================================================
+log "Step 3: Creating gateway consumer..."
+CONSUMER_RESULT=$(gateway_create_consumer "${CONSUMER_NAME}" "${WORKER_KEY}") \
+    || _fail "Gateway consumer creation failed for ${CONSUMER_NAME}"
+log "  Consumer result: ${CONSUMER_RESULT}"
+
+# Cloud backend may return a platform-assigned API key — use it if present
+GW_API_KEY=$(echo "${CONSUMER_RESULT}" | jq -r '.api_key // empty' 2>/dev/null)
+if [ -n "${GW_API_KEY}" ] && [ "${GW_API_KEY}" != "${WORKER_KEY}" ]; then
+    WORKER_KEY="${GW_API_KEY}"
+    WORKER_GATEWAY_KEY="${GW_API_KEY}"
+    log "  Using platform-assigned API key (prefix: ${WORKER_KEY:0:8}...)"
+fi
+
+# Pass consumer_id to gateway_authorize_routes (used by cloud backend)
+GATEWAY_CONSUMER_ID=$(echo "${CONSUMER_RESULT}" | jq -r '.consumer_id // empty' 2>/dev/null)
+export GATEWAY_CONSUMER_ID
+
 log "Step 4: Authorizing AI routes..."
-AI_ROUTES=$(curl -sf http://127.0.0.1:8001/v1/ai/routes \
-    -b "${HIGRESS_COOKIE_FILE}" 2>/dev/null) || _fail "Failed to list AI routes"
+gateway_authorize_routes "${CONSUMER_NAME}"
+log "  Routes authorized"
 
-ROUTE_NAMES=$(echo "${AI_ROUTES}" | jq -r '.data[]?.name // empty' 2>/dev/null || true)
-for route_name in ${ROUTE_NAMES}; do
-    [ -z "${route_name}" ] && continue
-    ROUTE_RESP=$(curl -sf "http://127.0.0.1:8001/v1/ai/routes/${route_name}" \
-        -b "${HIGRESS_COOKIE_FILE}" 2>/dev/null) || continue
-    ROUTE=$(echo "${ROUTE_RESP}" | jq '.data // .' 2>/dev/null)
-
-    ALREADY=$(echo "${ROUTE}" | jq -r '.authConfig.allowedConsumers[]? // empty' 2>/dev/null | grep -c "^${CONSUMER_NAME}$" || true)
-    if [ "${ALREADY}" -gt 0 ]; then
-        log "  Route ${route_name}: already authorized"
-        continue
-    fi
-
-    UPDATED=$(echo "${ROUTE}" | jq --arg c "${CONSUMER_NAME}" '.authConfig.allowedConsumers += [$c]')
-    curl -sf -X PUT "http://127.0.0.1:8001/v1/ai/routes/${route_name}" \
-        -b "${HIGRESS_COOKIE_FILE}" \
-        -H 'Content-Type: application/json' \
-        -d "${UPDATED}" > /dev/null 2>&1 || log "  WARNING: Failed to update route ${route_name}"
-    log "  Route ${route_name}: authorized"
-done
-
-# ============================================================
-# Step 5: Authorize MCP Servers
-# ============================================================
 log "Step 5: Authorizing MCP servers..."
-ALL_MCP_RAW=$(curl -sf http://127.0.0.1:8001/v1/mcpServer \
-    -b "${HIGRESS_COOKIE_FILE}" 2>/dev/null) || true
-ALL_MCP=$(echo "${ALL_MCP_RAW}" | jq '.data // .' 2>/dev/null || echo "${ALL_MCP_RAW}")
-
-if [ -n "${MCP_SERVERS}" ]; then
-    TARGET_MCP_LIST="${MCP_SERVERS}"
-else
-    TARGET_MCP_LIST=$(echo "${ALL_MCP}" | jq -r '.[].name // empty' 2>/dev/null | tr '\n' ',' || true)
-    TARGET_MCP_LIST="${TARGET_MCP_LIST%,}"
-fi
-
-if [ -n "${TARGET_MCP_LIST}" ]; then
-    IFS=',' read -ra MCP_ARR <<< "${TARGET_MCP_LIST}"
-    for mcp_name in "${MCP_ARR[@]}"; do
-        mcp_name=$(echo "${mcp_name}" | tr -d ' ')
-        [ -z "${mcp_name}" ] && continue
-
-        EXISTING_CONSUMERS=$(echo "${ALL_MCP}" | jq -r --arg n "${mcp_name}" \
-            '.[] | select(.name == $n) | .consumerAuthInfo.allowedConsumers // [] | .[]' 2>/dev/null || true)
-        CONSUMER_LIST="[\"manager\""
-        for ec in ${EXISTING_CONSUMERS}; do
-            [ "${ec}" = "manager" ] && continue
-            [ "${ec}" = "${CONSUMER_NAME}" ] && continue
-            CONSUMER_LIST="${CONSUMER_LIST},\"${ec}\""
-        done
-        CONSUMER_LIST="${CONSUMER_LIST},\"${CONSUMER_NAME}\"]"
-
-        curl -sf -X PUT http://127.0.0.1:8001/v1/mcpServer/consumers \
-            -b "${HIGRESS_COOKIE_FILE}" \
-            -H 'Content-Type: application/json' \
-            -d '{"mcpServerName":"'"${mcp_name}"'","consumers":'"${CONSUMER_LIST}"'}' > /dev/null 2>&1 \
-            || log "  WARNING: Failed to authorize MCP server ${mcp_name}"
-        log "  MCP ${mcp_name}: authorized"
-    done
-else
-    log "  No MCP servers found, skipping"
-fi
+gateway_authorize_mcp "${CONSUMER_NAME}" "${MCP_SERVERS}"
+log "  MCP authorization complete"
 
 # ============================================================
 # Step 6: Generate openclaw.json
@@ -438,18 +389,19 @@ fi
 # ============================================================
 # Step 8: Sync to MinIO
 # ============================================================
-log "Step 8: Syncing to MinIO..."
-mc mirror "/root/hiclaw-fs/agents/${WORKER_NAME}/" "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/" --overwrite 2>&1 | tail -5
-mc stat "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/SOUL.md" > /dev/null 2>&1 \
+log "Step 8: Syncing to storage..."
+ensure_mc_credentials 2>/dev/null || true
+mc mirror "/root/hiclaw-fs/agents/${WORKER_NAME}/" "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/" --overwrite 2>&1 | tail -5
+mc stat "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/SOUL.md" > /dev/null 2>&1 \
     || _fail "SOUL.md not found in MinIO after sync"
-mc stat "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/openclaw.json" > /dev/null 2>&1 \
+mc stat "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/openclaw.json" > /dev/null 2>&1 \
     || _fail "openclaw.json not found in MinIO after sync"
 
 # Write Matrix password directly to MinIO (never touches Worker's local filesystem)
 # Worker reads it via mc cat on startup for E2EE re-login
 _tmp_pw="/tmp/matrix-pw-$$"
 echo -n "${WORKER_PASSWORD}" > "${_tmp_pw}"
-mc cp "${_tmp_pw}" "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/credentials/matrix/password" 2>/dev/null \
+mc cp "${_tmp_pw}" "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/credentials/matrix/password" 2>/dev/null \
     || log "  WARNING: Failed to write Matrix password to MinIO"
 rm -f "${_tmp_pw}"
 
@@ -469,14 +421,14 @@ if [ -d "${WORKER_AGENT_SRC}" ]; then
     log "  Merging AGENTS.md (runtime=${WORKER_RUNTIME}) to worker MinIO..."
     source /opt/hiclaw/scripts/lib/builtin-merge.sh
     update_builtin_section_minio \
-        "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/AGENTS.md" \
+        "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/AGENTS.md" \
         "${WORKER_AGENT_SRC}/AGENTS.md" \
         || log "  WARNING: Failed to merge AGENTS.md"
     
     if [ -d "${FILESYNC_SRC}" ]; then
         log "  Pushing file-sync skill (${WORKER_RUNTIME}) to worker MinIO..."
         mc mirror "${FILESYNC_SRC}/" \
-            "hiclaw/hiclaw-storage/agents/${WORKER_NAME}/skills/file-sync/" --overwrite \
+            "${HICLAW_STORAGE_PREFIX}/agents/${WORKER_NAME}/skills/file-sync/" --overwrite \
             || log "  WARNING: Failed to push file-sync skill"
         log "  Worker agent files pushed"
     else
@@ -557,8 +509,6 @@ CONTAINER_ID=""
 INSTALL_CMD=""
 WORKER_STATUS="pending_install"
 
-source /opt/hiclaw/scripts/lib/container-api.sh
-
 _build_install_cmd() {
     # copaw workers run on the host, so use the externally-exposed gateway port.
     # openclaw workers run inside a container, so use the internal port 8080.
@@ -614,6 +564,41 @@ _build_extra_env() {
 if [ "${REMOTE_MODE}" = true ]; then
     log "Step 9: Remote mode requested"
     INSTALL_CMD=$(_build_install_cmd)
+elif [ "${HICLAW_RUNTIME}" = "aliyun" ]; then
+    log "Step 9: Creating Worker via cloud backend (SAE)..."
+
+    # Build complete SAE environment variables (Worker needs these to connect)
+    SAE_ENVS=$(jq -cn \
+        --arg worker_key "${WORKER_KEY}" \
+        --arg matrix_url "${HICLAW_MATRIX_URL:-}" \
+        --arg matrix_domain "${MATRIX_DOMAIN}" \
+        --arg matrix_token "${WORKER_MATRIX_TOKEN}" \
+        --arg ai_gw_url "${HICLAW_AI_GATEWAY_URL:-}" \
+        --arg oss_bucket "${HICLAW_OSS_BUCKET:-hiclaw-cloud-storage}" \
+        --arg region "${HICLAW_REGION:-cn-hangzhou}" \
+        '{
+            "HICLAW_WORKER_GATEWAY_KEY": $worker_key,
+            "HICLAW_MATRIX_URL": $matrix_url,
+            "HICLAW_MATRIX_DOMAIN": $matrix_domain,
+            "HICLAW_WORKER_MATRIX_TOKEN": $matrix_token,
+            "HICLAW_AI_GATEWAY_URL": $ai_gw_url,
+            "HICLAW_OSS_BUCKET": $oss_bucket,
+            "HICLAW_REGION": $region
+        }')
+    log "  SAE_ENVS: ${SAE_ENVS:0:200}..."
+
+    CREATE_OUTPUT=$(sae_create_worker "${WORKER_NAME}" "${SAE_ENVS}" 2>/dev/null) || true
+    log "  SAE create response: ${CREATE_OUTPUT:0:300}"
+    SAE_STATUS=$(echo "${CREATE_OUTPUT}" | jq -r '.status // "error"' 2>/dev/null)
+
+    if [ "${SAE_STATUS}" = "created" ] || [ "${SAE_STATUS}" = "exists" ]; then
+        DEPLOY_MODE="cloud"
+        WORKER_STATUS="starting"
+        log "  SAE application ready for ${WORKER_NAME}"
+    else
+        log "  WARNING: SAE application creation returned: ${CREATE_OUTPUT}"
+        WORKER_STATUS="error"
+    fi
 elif container_api_available; then
     log "Step 9: Starting Worker container locally (runtime=${WORKER_RUNTIME})..."
     EXTRA_ENV_JSON=$(_build_extra_env)
@@ -625,7 +610,6 @@ elif container_api_available; then
     fi
 
     CONTAINER_ID=$(echo "${CREATE_OUTPUT}" | tail -1)
-    # Extract actual console host port (randomly assigned, may differ from container port)
     CONSOLE_HOST_PORT=$(echo "${CREATE_OUTPUT}" | grep -o 'CONSOLE_HOST_PORT=[0-9]*' | head -1 | cut -d= -f2)
     if [ -n "${CONTAINER_ID}" ] && [ ${#CONTAINER_ID} -ge 12 ]; then
         DEPLOY_MODE="local"

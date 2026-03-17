@@ -30,10 +30,13 @@ COPY --from=mc /usr/bin/mc /usr/local/bin/mc
 #   which correctly resolves to <workspace>/.openclaw/openclaw.json
 ENV PATH="/opt/openclaw/packages/clawdbot/node_modules/.bin:${PATH}"
 
+# Shared environment bootstrap and credential management
+COPY --from=shared . /opt/hiclaw/scripts/lib/
+
 # Worker entrypoint and sync scripts
 COPY scripts/ /opt/hiclaw/scripts/
-RUN chmod +x /opt/hiclaw/scripts/*.sh && \
-    printf '#!/bin/bash\nexec /bin/sh "/root/hiclaw-fs/agents/${HICLAW_WORKER_NAME}/skills/file-sync/scripts/hiclaw-sync.sh" "$@"\n' \
+RUN find /opt/hiclaw/scripts -name '*.sh' -exec chmod +x {} + && \
+    printf '#!/bin/bash\nexec "/root/hiclaw-fs/agents/${HICLAW_WORKER_NAME}/skills/file-sync/scripts/hiclaw-sync.sh" "$@"\n' \
     > /usr/local/bin/hiclaw-sync && chmod +x /usr/local/bin/hiclaw-sync
 
 # hiclaw-fs root (mirrors Manager's ~/hiclaw-fs/ layout)

@@ -52,6 +52,7 @@ ENV OPENCLAW_CONFIG_PATH="/root/manager-workspace/openclaw.json"
 # ---- Copy HiClaw configuration and scripts ----
 # Our supervisord.conf replaces the Higress one; our scripts handle all components
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY --from=shared . /opt/hiclaw/scripts/lib/
 COPY scripts/ /opt/hiclaw/scripts/
 
 # Install systemctl shim so 'openclaw gateway restart' works without systemd
@@ -64,8 +65,7 @@ ARG BUILTIN_VERSION=latest
 RUN echo "${BUILTIN_VERSION}" > /opt/hiclaw/agent/.builtin-version
 
 # Make scripts executable
-RUN chmod +x /opt/hiclaw/scripts/init/*.sh /opt/hiclaw/scripts/lib/*.sh && \
-    chmod +x /opt/hiclaw/scripts/setup-host-symlinks.sh && \
+RUN find /opt/hiclaw/scripts -name '*.sh' -exec chmod +x {} + && \
     find /opt/hiclaw/agent/skills/*/scripts -name '*.sh' -exec chmod +x {} + 2>/dev/null || true && \
     find /opt/hiclaw/agent/worker-skills/*/scripts -name '*.sh' -exec chmod +x {} + 2>/dev/null || true && \
     find /opt/hiclaw/agent/worker-agent/skills/*/scripts -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
